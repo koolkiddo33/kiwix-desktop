@@ -185,7 +185,7 @@ private: // data
     QString m_searchQuery;
     QString m_categoryFilter = "all";
     QStringList m_contentTypeFilters;
-    kiwix::supportedListSortBy m_sortBy = kiwix::UNSORTED;
+    kiwix::supportedListSortBy m_sortBy = kiwix::TITLE;
     bool m_sortOrderAsc = true;
     LanguageList m_languages;
     QStringList m_categories;

@@ -1,13 +1,19 @@
 #include "contentmanager.h"
 
 #include "kiwixapp.h"
+#include "settingsmanager.h"
 #include <kiwix/manager.h>
 #include <kiwix/tools.h>
 
 #include <QDebug>
+#include <QFile>
+#include <QRegularExpression>
+#include <QSet>
 #include <QUrlQuery>
 #include <QUrl>
 #include <QDir>
+#include <algorithm>
+#include <stdexcept>
 #include <QMessageBox>
 #include "contentmanagermodel.h"
 #include <zim/error.h>
@@ -35,6 +41,158 @@ namespace
 SettingsManager* getSettingsManager()
 {
     return KiwixApp::instance()->getSettingsManager();
+}
+
+struct HiddenBookFilterRule
+{
+    enum class Field { Title, Url, Filename, Id };
+
+    Field field;
+    QString keyword;
+};
+
+QList<HiddenBookFilterRule> readHiddenBookRules()
+{
+    const QDir dataDirectory(getDataDirectory());
+    if (!dataDirectory.exists() && !QDir().mkpath(dataDirectory.path())) {
+        qWarning() << "Unable to create data directory for hidden book titles:"
+                   << dataDirectory.path();
+        return {};
+    }
+
+    QFile file(dataDirectory.filePath("hidden-book-titles.txt"));
+    if (!file.exists()) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            qWarning() << "Unable to create hidden book titles file:"
+                       << file.fileName() << file.errorString();
+            return {};
+        }
+        const QByteArray instructions(
+            "# Bare entries (or title:) match title words/phrases. "
+            "url:, filename:/name:, and id: match substrings.\n"
+            "# Prefix a line with # to disable it.\n");
+        if (file.write(instructions) != instructions.size()) {
+            qWarning() << "Unable to initialize hidden book titles file:"
+                       << file.fileName() << file.errorString();
+        }
+        return {};
+    }
+
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Unable to read hidden book titles file:"
+                   << file.fileName() << file.errorString();
+        return {};
+    }
+
+    const auto content = file.readAll();
+    if (file.error() != QFile::NoError) {
+        qWarning() << "Unable to read hidden book titles file:"
+                   << file.fileName() << file.errorString();
+        return {};
+    }
+
+    QList<HiddenBookFilterRule> rules;
+    for (const auto& line : QString::fromUtf8(content).split('\n')) {
+        auto entry = line.trimmed();
+        if (entry.isEmpty() || entry.startsWith('#')) {
+            continue;
+        }
+
+        auto field = HiddenBookFilterRule::Field::Title;
+        const auto separator = entry.indexOf(':');
+        if (separator > 0) {
+            const auto prefix = entry.left(separator).toLower();
+            if (prefix == "title") {
+                field = HiddenBookFilterRule::Field::Title;
+                entry = entry.mid(separator + 1).trimmed();
+            } else if (prefix == "url") {
+                field = HiddenBookFilterRule::Field::Url;
+                entry = entry.mid(separator + 1).trimmed();
+            } else if (prefix == "filename" || prefix == "name") {
+                field = HiddenBookFilterRule::Field::Filename;
+                entry = entry.mid(separator + 1).trimmed();
+            } else if (prefix == "id") {
+                field = HiddenBookFilterRule::Field::Id;
+                entry = entry.mid(separator + 1).trimmed();
+            }
+        }
+
+        if (!entry.isEmpty()) {
+            rules.append({field, entry});
+        }
+    }
+    return rules;
+}
+
+bool bookMatchesHiddenRule(const kiwix::Book& book,
+                           const HiddenBookFilterRule& rule)
+{
+    if (rule.field == HiddenBookFilterRule::Field::Title) {
+        const auto title = QString::fromStdString(book.getTitle());
+        const QRegularExpression expression(
+            QStringLiteral("\\b%1\\b").arg(QRegularExpression::escape(rule.keyword)),
+            QRegularExpression::CaseInsensitiveOption);
+        return expression.match(title).hasMatch();
+    }
+
+    QString value;
+    if (rule.field == HiddenBookFilterRule::Field::Url) {
+        value = QString::fromStdString(
+            book.getUrl(kiwix::Book::AcquisitionLinkKind::DIRECT));
+    } else if (rule.field == HiddenBookFilterRule::Field::Filename) {
+        const auto name = QString::fromStdString(book.getName());
+        const auto url = QUrl(QString::fromStdString(
+            book.getUrl(kiwix::Book::AcquisitionLinkKind::DIRECT)));
+        const auto filename = url.path().section('/', -1);
+        return name.contains(rule.keyword, Qt::CaseInsensitive)
+            || filename.contains(rule.keyword, Qt::CaseInsensitive);
+    } else {
+        value = QString::fromStdString(book.getId());
+    }
+
+    return value.contains(rule.keyword, Qt::CaseInsensitive);
+}
+
+QSet<QString> getAvailableLocalBookIds(const Library& library)
+{
+    QSet<QString> ids;
+    for (const auto& id : library.getBookIds()) {
+        if (!library.getBookDownloadId(id).empty()) {
+            continue;
+        }
+        try {
+            if (library.getBookById(id).isPathValid()) {
+                ids.insert(id);
+            }
+        } catch (const std::out_of_range&) {
+            qWarning() << "Book disappeared while checking local library:"
+                       << id;
+        }
+    }
+    return ids;
+}
+
+QString formatBookMetadata(const kiwix::Book& book)
+{
+    QStringList lines;
+    const auto addField = [&lines](const QString& label, const QString& value) {
+        if (!value.isEmpty()) {
+            lines.append(label + ": " + value);
+        }
+    };
+
+    addField(gt("title"), QString::fromStdString(book.getTitle()));
+    addField(gt("zim-id"), QString::fromStdString(book.getId()));
+    addField(gt("zim-name"), QString::fromStdString(book.getName()));
+    addField(gt("zim-path"), QString::fromStdString(book.getPath()));
+    addField(gt("date"), QString::fromStdString(book.getDate()));
+    addField(gt("size"), QString::number(book.getSize()) + " bytes");
+    addField(gt("book-download-url"), QString::fromStdString(
+        book.getUrl(kiwix::Book::AcquisitionLinkKind::DIRECT)));
+    addField(gt("book-tags"), QString::fromStdString(book.getTags()));
+    addField(gt("book-description"), QString::fromStdString(book.getDescription()));
+
+    return lines.join('\n');
 }
 
 // Opens the directory containing the input file path.
@@ -156,6 +314,7 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
     QAction menuCancelBook(gt("cancel-download"), this);
     QAction menuOpenFolder(gt("open-folder"), this);
     QAction menuPreviewBook(gt("preview-book-in-web-browser"), this);
+    QAction menuShowBookMetadata(gt("show-book-metadata"), this);
 
     const auto bookState = getBookState(id);
     switch ( bookState ) {
@@ -165,6 +324,7 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
             contextMenu.addAction(&menuCancelBook);
         }
         contextMenu.addAction(&menuPreviewBook);
+        contextMenu.addAction(&menuShowBookMetadata);
         break;
 
     case BookState::DOWNLOADING:
@@ -173,6 +333,7 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
             contextMenu.addAction(&menuCancelBook);
         }
         contextMenu.addAction(&menuPreviewBook);
+        contextMenu.addAction(&menuShowBookMetadata);
         break;
 
     case BookState::AVAILABLE_LOCALLY_AND_HEALTHY:
@@ -186,6 +347,7 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
             }
             contextMenu.addAction(&menuDeleteBook);
             contextMenu.addAction(&menuOpenFolder);
+            contextMenu.addAction(&menuShowBookMetadata);
             connect(&menuOpenFolder, &QAction::triggered, [=]() {
                 openFileLocation(bookPath, mp_view);
             });
@@ -195,6 +357,11 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
     case BookState::AVAILABLE_ONLINE:
         contextMenu.addAction(&menuDownloadBook);
         contextMenu.addAction(&menuPreviewBook);
+        contextMenu.addAction(&menuShowBookMetadata);
+        break;
+
+    case BookState::METADATA_ONLY:
+        contextMenu.addAction(&menuShowBookMetadata);
         break;
 
     default: break;
@@ -220,6 +387,29 @@ void ContentManager::onCustomContextMenu(const QPoint &point)
     });
     connect(&menuPreviewBook, &QAction::triggered, [=]() {
         openBookPreview(id);
+    });
+    connect(&menuShowBookMetadata, &QAction::triggered, [=]() {
+        QString metadata;
+        try {
+            if (m_local) {
+                metadata = formatBookMetadata(mp_library->getBookById(id));
+            } else {
+                QMutexLocker locker(&remoteLibraryLocker);
+                const auto& book = mp_remoteLibrary->getBookById(id.toStdString());
+                metadata = formatBookMetadata(book);
+            }
+        } catch (const std::out_of_range&) {
+            KiwixApp::instance()->showMessage(
+                gt("book-metadata-unavailable"), gt("book-metadata"),
+                QMessageBox::Warning);
+            return;
+        }
+
+        QMessageBox dialog(QMessageBox::Information, gt("book-metadata"),
+                           metadata, QMessageBox::Ok, mp_view);
+        dialog.setTextInteractionFlags(Qt::TextSelectableByMouse
+                                       | Qt::TextSelectableByKeyboard);
+        dialog.exec();
     });
 
     contextMenu.exec(mp_view->getView()->viewport()->mapToGlobal(point));
@@ -452,21 +642,42 @@ void ContentManager::openBook(const QString &id)
 
 void ContentManager::openBookPreview(const QString &id)
 {
+    std::string downloadUrl;
     try {
         QMutexLocker locker(&remoteLibraryLocker);
-        const std::string &downloadUrl =
-            mp_remoteLibrary->getBookById(id.toStdString()).getUrl(kiwix::Book::AcquisitionLinkKind::DIRECT);
-        locker.unlock();
+        downloadUrl = mp_remoteLibrary->getBookById(id.toStdString())
+                          .getUrl(kiwix::Book::AcquisitionLinkKind::DIRECT);
+    } catch (const std::out_of_range&) {
+        KiwixApp::instance()->showMessage(
+            gt("book-metadata-unavailable"), gt("preview-book-in-web-browser"),
+            QMessageBox::Warning);
+        return;
+    }
 
-        /* Extract the Zim name from the book's download URL */
-        const auto zimNameStartIndex = downloadUrl.find_last_of('/') + 1;
-        const std::string& zimName = downloadUrl.substr(
-            zimNameStartIndex,
-            downloadUrl.find(".zim", zimNameStartIndex) - zimNameStartIndex);
+    const auto zimFileName = QUrl(QString::fromStdString(downloadUrl))
+                                 .path().section('/', -1);
+    const auto zimExtension = zimFileName.indexOf(".zim", 0, Qt::CaseInsensitive);
+    if (zimExtension < 0) {
+        KiwixApp::instance()->showMessage(
+            gt("preview-book-open-failed"), gt("preview-book-in-web-browser"),
+            QMessageBox::Warning);
+        return;
+    }
 
-        const QUrl previewUrl = getRemoteLibraryUrl() + "/viewer#" + zimName.c_str();
-        QDesktopServices::openUrl(previewUrl);
-    } catch (...) {}
+    QUrl previewUrl(getRemoteLibraryUrl());
+    auto previewHost = previewUrl.host();
+    if (previewHost.startsWith("opds.library.")) {
+        previewHost.replace(0, 4, "browse");
+        previewUrl.setHost(previewHost);
+    }
+    previewUrl.setPath("/viewer");
+    previewUrl.setQuery(QString());
+    previewUrl.setFragment(zimFileName.left(zimExtension));
+    if (!previewUrl.isValid() || !QDesktopServices::openUrl(previewUrl)) {
+        KiwixApp::instance()->showMessage(
+            gt("preview-book-open-failed"), gt("preview-book-in-web-browser"),
+            QMessageBox::Warning);
+    }
 }
 
 void ContentManager::removeDownload(QString bookId)
@@ -829,12 +1040,26 @@ QStringList ContentManager::getBookIds()
         return mp_library->listBookIds(filter, m_sortBy, m_sortOrderAsc);
     } else {
         filter.remote(true);
+        const auto availableLocally = getAvailableLocalBookIds(*mp_library);
+        const auto hiddenRules = readHiddenBookRules();
         QMutexLocker locker(&remoteLibraryLocker);
         auto bookIds = mp_remoteLibrary->filter(filter);
         mp_remoteLibrary->sort(bookIds, m_sortBy, m_sortOrderAsc);
         QStringList list;
-        for(auto& bookId:bookIds) {
-            list.append(QString::fromStdString(bookId));
+        for (const auto& bookId : bookIds) {
+            const auto& book = mp_remoteLibrary->getBookById(bookId);
+            const auto qBookId = QString::fromStdString(bookId);
+            if (availableLocally.contains(qBookId)) {
+                continue;
+            }
+            const auto isHidden = std::any_of(
+                hiddenRules.cbegin(), hiddenRules.cend(),
+                [&book](const HiddenBookFilterRule& rule) {
+                    return bookMatchesHiddenRule(book, rule);
+                });
+            if (!isHidden) {
+                list.append(qBookId);
+            }
         }
         return list;
     }
